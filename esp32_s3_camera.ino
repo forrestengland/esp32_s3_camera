@@ -179,21 +179,6 @@ bool initCamera() {
   return esp_camera_init(&c) == ESP_OK;
 }
 
-// ======================= Snapshot =======================
-void saveSnapshot(camera_fb_t *fb) {
-  if (!sdOk) { notify("No SD card"); return; }
-  char path[24];
-  do {
-    snprintf(path, sizeof(path), "/IMG_%08X.jpg", (unsigned)esp_random());
-  } while (SD_MMC.exists(path));
-
-  File f = SD_MMC.open(path, FILE_WRITE);
-  bool ok = f && f.write(fb->buf, fb->len) == fb->len;
-  if (f) f.close();
-  if (ok) Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)fb->len);
-  notify(ok ? "Saved!" : "Save failed");
-}
-
 // ======================= AVI writing =======================
 static void put32(uint8_t *&p, uint32_t v) { memcpy(p, &v, 4); p += 4; }
 static void put16(uint8_t *&p, uint16_t v) { memcpy(p, &v, 2); p += 2; }
@@ -403,6 +388,36 @@ void drawEffects() {
   }
 }
 
+void saveSnapshot(camera_fb_t *fb, bool decoded) {
+  if (!sdOk) { notify("No SD card"); return; }
+
+  const uint8_t *data = fb->buf;
+  size_t len = fb->len;
+  uint8_t *enc = nullptr;
+
+  if (curEffect && decoded) {                      // bake the active effect into the saved file
+    const uint8_t snapQuality = 90;                // 0-100, higher = better
+    if (!FRAME_BE) fxByteSwap(frameBuf, IMG_W * IMG_H);   // encoder expects the camera's byte order
+    bool ok = fmt2jpg((uint8_t *)frameBuf, IMG_W * IMG_H * 2, IMG_W, IMG_H,
+                      PIXFORMAT_RGB565, snapQuality, &enc, &len);
+    if (!FRAME_BE) fxByteSwap(frameBuf, IMG_W * IMG_H);   // restore for display
+    if (!ok) { notify("Encode failed"); return; }
+    data = enc;
+  }
+
+  char path[24];
+  do {
+    snprintf(path, sizeof(path), "/IMG_%08X.jpg", (unsigned)esp_random());
+  } while (SD_MMC.exists(path));
+
+  File f = SD_MMC.open(path, FILE_WRITE);
+  bool ok = f && f.write(data, len) == len;
+  if (f) f.close();
+  free(enc);                                       // safe when enc is nullptr
+  if (ok) Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)len);
+  notify(ok ? "Saved!" : "Save failed");
+}
+
 // ======================= Gallery =======================
 void loadList() {
   files.clear();
@@ -544,16 +559,14 @@ void liveStep(int ev, int kev, int d) {
     esp_camera_sensor_get()->set_brightness(esp_camera_sensor_get(), brightness);
   }
 
-  camera_fb_t *fb = esp_camera_fb_get();
+	camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
   if (rec && !recWrite(fb)) { recStop(); notify("Write failed"); }
-  if (ev == 1) saveSnapshot(fb);                   // encoder short press -> snapshot
   bool ok = decodeToFrame(fb->buf, fb->len);
+  if (ok) applyEffect();
+  if (ev == 1) saveSnapshot(fb, ok);               // encoder short press -> snapshot
   esp_camera_fb_return(fb);
-  if (ok) {
-    applyEffect();
-    blit(frameBuf);
-  }
+  if (ok) blit(frameBuf);
   drawOverlay();
 }
 
