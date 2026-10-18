@@ -358,10 +358,19 @@ void fxSwapColors(uint16_t *px, size_t count) {   // red <-> blue
   }
 }
 
+void fxByteSwap(uint16_t *px, size_t count) {      // simulates the wrong byte order
+  uint32_t *p = (uint32_t *)px;                    // two pixels per 32-bit word
+  for (size_t i = 0; i < count / 2; i++) {
+    uint32_t w = p[i];
+    p[i] = ((w & 0x00FF00FF) << 8) | ((w >> 8) & 0x00FF00FF);
+  }
+}
+
 const Effect effects[] = {
   {"None", nullptr},
   {"Invert", fxInvert},
   {"Swap colors", fxSwapColors},
+  {"Byte swap", fxByteSwap},   // new
 };
 const int NUM_EFFECTS = sizeof(effects) / sizeof(effects[0]);
 int curEffect = 0;   // active effect
