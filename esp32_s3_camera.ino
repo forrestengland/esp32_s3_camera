@@ -1,5 +1,6 @@
 #include <Arduino_GFX_Library.h>
-#include "esp_camera.h"
+#include <SD_MMC.h>
+#include <esp_camera.h>
 
 // ---- Display pins ----
 #define TFT_SCK 21
@@ -13,6 +14,16 @@
 #define ENC_A 1
 #define ENC_B 2
 #define ENC_SW 3
+
+// ---- SD card (Freenove 1-bit SD_MMC) ----
+#define SD_CLK 39
+#define SD_CMD 38
+#define SD_D0  40
+
+bool sdOk = false;
+bool lastSw = HIGH;
+uint32_t msgUntil = 0;
+const char *msg = "";
 
 // ---- Freenove ESP32-S3 WROOM camera pins ----
 #define PWDN_GPIO_NUM -1
@@ -64,8 +75,42 @@ bool initCamera() {
   return esp_camera_init(&c) == ESP_OK;
 }
 
+void saveSnapshot(camera_fb_t *fb) {
+  if (!sdOk) { msg = "No SD card"; msgUntil = millis() + 1500; return; }
+
+  // Random name, retried if it already exists
+  char path[24];
+  do {
+    snprintf(path, sizeof(path), "/IMG_%08X.jpg", (unsigned)esp_random());
+  } while (SD_MMC.exists(path));
+
+  uint8_t *jpg = nullptr;
+  size_t jpgLen = 0;
+  bool ok = frame2jpg(fb, 85, &jpg, &jpgLen);   // quality 0-100
+  if (ok) {
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (f) {
+      ok = (f.write(jpg, jpgLen) == jpgLen);
+      f.close();
+    } else {
+      ok = false;
+    }
+  }
+  free(jpg);
+
+  if (ok) Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)jpgLen);
+  msg = ok ? "Saved!" : "Save failed";
+  msgUntil = millis() + 1500;
+}
+
 void setup() {
-  Serial.begin(115200);
+
+	Serial.begin(115200);
+
+	SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
+	sdOk = SD_MMC.begin("/sdcard", true);   // true = 1-bit mode
+	Serial.println(sdOk ? "SD mounted" : "SD mount failed");
+	
 	//  pinMode(TFT_BLK, OUTPUT); digitalWrite(TFT_BLK, HIGH);
   pinMode(ENC_A, INPUT_PULLUP); pinMode(ENC_B, INPUT_PULLUP); pinMode(ENC_SW, INPUT_PULLUP);
   lastA = digitalRead(ENC_A);
@@ -84,20 +129,32 @@ void setup() {
 }
 
 void loop() {
-  // Encoder -> camera brightness (-2..2), push -> reset
+  // Encoder rotation -> camera brightness (-2..2)
   int d = encDelta; encDelta = 0;
   if (d) {
     brightness = constrain(brightness + (d > 0 ? 1 : -1), -2, 2);
     esp_camera_sensor_get()->set_brightness(esp_camera_sensor_get(), brightness);
   }
-  if (digitalRead(ENC_SW) == LOW) {
-    brightness = 0;
-    esp_camera_sensor_get()->set_brightness(esp_camera_sensor_get(), 0);
-    delay(200);
-  }
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
+
+  // Encoder push -> save snapshot (on press edge only)
+  bool sw = digitalRead(ENC_SW);
+  if (lastSw == HIGH && sw == LOW) {
+    saveSnapshot(fb);
+    delay(50);   // simple debounce
+  }
+  lastSw = sw;
+
   gfx->draw16bitBeRGBBitmap(0, 0, (uint16_t *)fb->buf, fb->width, fb->height);
   esp_camera_fb_return(fb);
+
+  // On-screen feedback
+  if (millis() < msgUntil) {
+    gfx->setTextSize(2);
+    gfx->setTextColor(RGB565_GREEN, RGB565_BLACK);
+    gfx->setCursor(8, 8);
+    gfx->print(msg);
+  }
 }
