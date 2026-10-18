@@ -1,5 +1,5 @@
 // ESP32-S3 CAM + ST7789 + rotary encoder
-// Live view, snapshots, MJPEG/AVI video recording, gallery, effects menu.
+// Live view, snapshots, MJPEG/AVI video recording, gallery, effects + image settings menu.
 //
 // Board: ESP32S3 Dev Module, PSRAM: OPI PSRAM
 // Library: GFX Library for Arduino
@@ -65,7 +65,7 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, G
 Arduino_GFX *gfx = new Arduino_ST7789(bus, TFT_RST, DISPLAY_ROTATION, DISPLAY_IPS, 240, 320);
 
 // ======================= State =======================
-enum Mode { LIVE, LIST, VIEW, PLAYBACK, EFFECTS };
+enum Mode { LIVE, LIST, VIEW, PLAYBACK, EFFECTS, ADJUST };
 Mode mode = LIVE;
 
 struct Btn {
@@ -77,7 +77,9 @@ struct Btn {
 Btn encBtn = {ENC_SW, false, false, 0};
 Btn kBtn = {REC_BTN, false, false, 0};
 
-int brightness = 0;
+int brightness = 0;      // sensor image settings, -2..2
+int contrast = 0;
+int saturation = 0;
 volatile int encDelta = 0;
 int lastA;
 int encAccum = 0;
@@ -324,12 +326,12 @@ bool playStep() {
 }
 
 // ======================= Effects =======================
-// Effects run on the decoded frame in the live view only. Snapshots and videos are saved
-// unmodified because they come straight from the camera's JPEG.
-// To add an effect: write a function like the two below and add a row to effects[].
+// Software effects run on the decoded frame (live view; baked into snapshots by re-encoding;
+// not applied to video). Camera effects ("Cam: ...") run inside the sensor, so they are in
+// the live view, snapshots and video alike.
+// To add a software effect: write a function like the ones below and add a row to effects[].
 typedef void (*EffectFn)(uint16_t *px, size_t count);
 struct Effect { const char *name; EffectFn fn; int sensor; };   // sensor: camera effect 0-6
-//struct Effect { const char *name; EffectFn fn; };
 
 void fxInvert(uint16_t *px, size_t count) {
   uint32_t *p = (uint32_t *)px;                // two pixels per 32-bit word
@@ -345,7 +347,7 @@ void fxSwapColors(uint16_t *px, size_t count) {   // red <-> blue
 }
 
 void fxByteSwap(uint16_t *px, size_t count) {      // simulates the wrong byte order
-  uint32_t *p = (uint32_t *)px;                    // two pixels per 32-bit word
+  uint32_t *p = (uint32_t *)px;
   for (size_t i = 0; i < count / 2; i++) {
     uint32_t w = p[i];
     p[i] = ((w & 0x00FF00FF) << 8) | ((w >> 8) & 0x00FF00FF);
@@ -378,39 +380,68 @@ void applyEffect() {
   if (effects[curEffect].fn) effects[curEffect].fn(frameBuf, IMG_W * IMG_H);
 }
 
+// ---- Adjustable image settings (sensor-side, so they are in snapshots and video too) ----
+// To add one: write a small setter like the three below and add a row to settings[].
+void setBrightnessReg(sensor_t *s, int v) { s->set_brightness(s, v); }
+void setContrastReg(sensor_t *s, int v)   { s->set_contrast(s, v); }
+void setSaturationReg(sensor_t *s, int v) { s->set_saturation(s, v); }
+
+struct Setting { const char *name; int *value; int minV, maxV; void (*set)(sensor_t *, int); };
+const Setting settings[] = {
+  {"Brightness", &brightness, -2, 2, setBrightnessReg},
+  {"Contrast",   &contrast,   -2, 2, setContrastReg},
+  {"Saturation", &saturation, -2, 2, setSaturationReg},
+};
+const int NUM_SETTINGS = sizeof(settings) / sizeof(settings[0]);
+int adjIdx = 0;      // which setting is being adjusted
+
+void applySetting(int i) {
+  settings[i].set(esp_camera_sensor_get(), *settings[i].value);
+}
+
+// Menu rows: all effects first, then the adjustable settings.
 void drawEffects() {
-  const int rowH = 24, rows = 8;
+  const int rowH = 24, rows = 8, total = NUM_EFFECTS + NUM_SETTINGS;
   gfx->fillScreen(RGB565_BLACK);
   gfx->setTextSize(2);
   gfx->setTextColor(RGB565_CYAN, RGB565_BLACK);
   gfx->setCursor(4, 4);
-  gfx->print("Effects");
-  int top = constrain(fxSel - rows / 2, 0, max(0, NUM_EFFECTS - rows));
-  for (int i = 0; i < rows && top + i < NUM_EFFECTS; i++) {
+  gfx->print("Effects & settings");
+  int top = constrain(fxSel - rows / 2, 0, max(0, total - rows));
+  for (int i = 0; i < rows && top + i < total; i++) {
     int idx = top + i, y = 28 + i * rowH;
     uint16_t bg = (idx == fxSel) ? RGB565_BLUE : RGB565_BLACK;
     gfx->fillRect(0, y, 320, rowH, bg);
     gfx->setTextColor(RGB565_WHITE, bg);
     gfx->setCursor(8, y + 4);
-    gfx->print(effects[idx].name);
-    if (idx == curEffect) {                     // mark the active effect
-      gfx->setTextColor(RGB565_GREEN, bg);
-      gfx->setCursor(290, y + 4);
-      gfx->print("*");
+    if (idx < NUM_EFFECTS) {
+      gfx->print(effects[idx].name);
+      if (idx == curEffect) {                   // mark the active effect
+        gfx->setTextColor(RGB565_GREEN, bg);
+        gfx->setCursor(290, y + 4);
+        gfx->print("*");
+      }
+    } else {
+      const Setting &st = settings[idx - NUM_EFFECTS];
+      gfx->print(st.name);
+      gfx->setTextColor(RGB565_YELLOW, bg);
+      gfx->setCursor(262, y + 4);
+      gfx->printf("%+d", *st.value);
     }
   }
 }
 
+// ======================= Snapshot =======================
+// Camera effects and plain snapshots save the camera's JPEG as is. A software effect is
+// applied to the decoded frame and re-encoded, so the saved file matches the screen.
 void saveSnapshot(camera_fb_t *fb, bool decoded) {
-	
   if (!sdOk) { notify("No SD card"); return; }
 
   const uint8_t *data = fb->buf;
   size_t len = fb->len;
   uint8_t *enc = nullptr;
 
-	  if (effects[curEffect].fn && decoded) {          // software effect: bake it in by re-encoding
-			//  if (curEffect && decoded) {                      // bake the active effect into the saved file
+  if (effects[curEffect].fn && decoded) {          // software effect: bake it in
     const uint8_t snapQuality = 90;                // 0-100, higher = better
     if (!FRAME_BE) fxByteSwap(frameBuf, IMG_W * IMG_H);   // encoder expects the camera's byte order
     bool ok = fmt2jpg((uint8_t *)frameBuf, IMG_W * IMG_H * 2, IMG_W, IMG_H,
@@ -569,12 +600,12 @@ void liveStep(int ev, int kev, int d) {
   }
   if (kev == 1) { if (rec) recStop(); else recStart(); }   // K0 short press -> record on/off
 
-  if (d) {
+  if (d) {                                         // rotation = quick brightness adjust
     brightness = constrain(brightness + (d > 0 ? 1 : -1), -2, 2);
-    esp_camera_sensor_get()->set_brightness(esp_camera_sensor_get(), brightness);
+    applySetting(0);
   }
 
-	camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
   if (rec && !recWrite(fb)) { recStop(); notify("Write failed"); }
   bool ok = decodeToFrame(fb->buf, fb->len);
@@ -583,6 +614,36 @@ void liveStep(int ev, int kev, int d) {
   esp_camera_fb_return(fb);
   if (ok) blit(frameBuf);
   drawOverlay();
+}
+
+// Live view with a readout for the setting being adjusted.
+// Rotate = change, K0 short = reset to 0, encoder press / long press / K0 long = done.
+void adjustStep(int ev, int kev, int d) {
+  const Setting &st = settings[adjIdx];
+  if (ev == 1 || ev == 2 || kev == 2) { mode = LIVE; return; }
+  if (kev == 1) { *st.value = 0; applySetting(adjIdx); }
+  int steps = encSteps(d);
+  if (steps) {
+    *st.value = constrain(*st.value + steps, st.minV, st.maxV);
+    applySetting(adjIdx);
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;
+  bool ok = decodeToFrame(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  if (ok) {
+    applyEffect();
+    blit(frameBuf);
+  }
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_YELLOW, RGB565_BLACK);
+  gfx->setCursor(8, 8);
+  gfx->printf("%s %+d ", st.name, *st.value);
+  gfx->setTextSize(1);
+  gfx->setTextColor(RGB565_WHITE, RGB565_BLACK);
+  gfx->setCursor(2, 230);
+  gfx->print("turn: adjust   K0: reset   press: done");
 }
 
 // ======================= Arduino entry points =======================
@@ -654,15 +715,28 @@ void loop() {
       break;
 
     case EFFECTS: {
-      if (ev == 2 || kev == 2) { mode = LIVE; break; }          // cancel, keep current effect
+      int total = NUM_EFFECTS + NUM_SETTINGS;
+      if (ev == 2 || kev == 2) { mode = LIVE; break; }          // cancel, keep current settings
       int steps = encSteps(d);
       if (steps) {
-        fxSel = ((fxSel + steps) % NUM_EFFECTS + NUM_EFFECTS) % NUM_EFFECTS;
+        fxSel = ((fxSel + steps) % total + total) % total;
         drawEffects();
       }
-			if (ev == 1) { selectEffect(fxSel); mode = LIVE; }        // select, return to live view
-			//      if (ev == 1) { curEffect = fxSel; mode = LIVE; }          // select, return to live view
+      if (ev == 1) {
+        if (fxSel < NUM_EFFECTS) {                              // effect: select, back to live
+          selectEffect(fxSel);
+          mode = LIVE;
+        } else {                                                // setting: adjust it on the live view
+          adjIdx = fxSel - NUM_EFFECTS;
+          encAccum = 0;
+          mode = ADJUST;
+        }
+      }
       break;
     }
+
+    case ADJUST:
+      adjustStep(ev, kev, d);
+      break;
   }
 }
