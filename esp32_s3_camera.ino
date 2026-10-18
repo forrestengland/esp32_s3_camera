@@ -22,6 +22,7 @@
 #define CAM_VFLIP        1
 #define CAM_HMIRROR      0
 #define FRAME_BE         false    // byte order of decoded frames. If colors look swapped, set false.
+#define ROTATE_CAMERA_90 0
 
 // ======================= Encoder / buttons =======================
 #define ENC_A   1
@@ -89,6 +90,7 @@ char msg[32] = "";
 uint32_t msgUntil = 0;
 
 uint16_t *frameBuf = nullptr;   // one decoded RGB565 frame, shared by live / viewer / player
+uint16_t *rotatedBuf = nullptr;
 uint8_t *jpgBuf = nullptr;      // one JPEG, shared by viewer / player
 
 std::vector<String> files;
@@ -123,9 +125,51 @@ void fatal(const char *m) {
   while (true) delay(1000);
 }
 
+// Rotate clockwise while mapping the result to the
+// existing 320x240 landscape display.
 inline void blit(uint16_t *buf) {
-  if (FRAME_BE) gfx->draw16bitBeRGBBitmap(0, 0, buf, IMG_W, IMG_H);
-  else gfx->draw16bitRGBBitmap(0, 0, buf, IMG_W, IMG_H);
+#if ROTATE_CAMERA_90
+  static uint16_t rotated[IMG_W * IMG_H];
+
+  for (int y = 0; y < IMG_H; y++) {
+    for (int x = 0; x < IMG_W; x++) {
+      // Clockwise rotation, scaled to fit landscape:
+      int srcX = (y * IMG_W) / IMG_H;
+      int srcY = IMG_H - 1 - (x * IMG_H) / IMG_W;
+
+      srcX = constrain(srcX, 0, IMG_W - 1);
+      srcY = constrain(srcY, 0, IMG_H - 1);
+
+      rotated[y * IMG_W + x] =
+          buf[srcY * IMG_W + srcX];
+    }
+  }
+
+  if (FRAME_BE)
+    gfx->draw16bitBeRGBBitmap(0, 0, rotated, IMG_W, IMG_H);
+  else
+    gfx->draw16bitRGBBitmap(0, 0, rotated, IMG_W, IMG_H);
+#else
+  if (FRAME_BE)
+    gfx->draw16bitBeRGBBitmap(0, 0, buf, IMG_W, IMG_H);
+  else
+    gfx->draw16bitRGBBitmap(0, 0, buf, IMG_W, IMG_H);
+#endif
+}
+
+#define ROTATE_CAMERA_90 1  // 1 = rotate clockwise, 0 = disabled
+
+void rotateFrame90(uint16_t *src, uint16_t *dst,
+                   int srcW, int srcH) {
+  for (int y = 0; y < srcH; y++) {
+    for (int x = 0; x < srcW; x++) {
+      // Rotate 90 degrees clockwise
+      int dstX = srcH - 1 - y;
+      int dstY = x;
+
+      dst[dstY * srcH + dstX] = src[y * srcW + x];
+    }
+  }
 }
 
 // Pixel value in native byte order (for effects that need to look at the color channels).
@@ -664,9 +708,9 @@ void setup() {
   Serial.println(sdOk ? "SD mounted" : "SD mount failed");
 
   frameBuf = (uint16_t *)ps_malloc(IMG_W * IMG_H * 2);
+	rotatedBuf = (uint16_t *)ps_malloc(IMG_W * IMG_H * 2);
   jpgBuf = (uint8_t *)ps_malloc(JPG_BUF_SZ);
-  if (!frameBuf || !jpgBuf) fatal("Out of PSRAM");
-
+	if (!frameBuf || !rotatedBuf || !jpgBuf) fatal("Out of PSRAM");
   if (!initCamera()) fatal("Camera init failed");
   sensor_t *s = esp_camera_sensor_get();
   s->set_vflip(s, CAM_VFLIP);
