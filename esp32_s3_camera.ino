@@ -328,7 +328,8 @@ bool playStep() {
 // unmodified because they come straight from the camera's JPEG.
 // To add an effect: write a function like the two below and add a row to effects[].
 typedef void (*EffectFn)(uint16_t *px, size_t count);
-struct Effect { const char *name; EffectFn fn; };
+struct Effect { const char *name; EffectFn fn; int sensor; };   // sensor: camera effect 0-6
+//struct Effect { const char *name; EffectFn fn; };
 
 void fxInvert(uint16_t *px, size_t count) {
   uint32_t *p = (uint32_t *)px;                // two pixels per 32-bit word
@@ -352,14 +353,26 @@ void fxByteSwap(uint16_t *px, size_t count) {      // simulates the wrong byte o
 }
 
 const Effect effects[] = {
-  {"None", nullptr},
-  {"Invert", fxInvert},
-  {"Swap colors", fxSwapColors},
-  {"Byte swap", fxByteSwap},   // new
+  {"None",             nullptr,       0},
+  {"Invert",           fxInvert,      0},
+  {"Swap colors",      fxSwapColors,  0},
+  {"Byte swap",        fxByteSwap,    0},
+  {"Cam: Negative",    nullptr,       1},
+  {"Cam: Grayscale",   nullptr,       2},
+  {"Cam: Sepia",       nullptr,       6},
+  {"Cam: Red tint",    nullptr,       3},
+  {"Cam: Green tint",  nullptr,       4},
+  {"Cam: Blue tint",   nullptr,       5},
 };
 const int NUM_EFFECTS = sizeof(effects) / sizeof(effects[0]);
 int curEffect = 0;   // active effect
 int fxSel = 0;       // highlighted row in the menu
+
+void selectEffect(int idx) {
+  curEffect = idx;
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_special_effect(s, effects[idx].sensor);   // 0 clears any camera effect
+}
 
 void applyEffect() {
   if (effects[curEffect].fn) effects[curEffect].fn(frameBuf, IMG_W * IMG_H);
@@ -389,13 +402,15 @@ void drawEffects() {
 }
 
 void saveSnapshot(camera_fb_t *fb, bool decoded) {
+	
   if (!sdOk) { notify("No SD card"); return; }
 
   const uint8_t *data = fb->buf;
   size_t len = fb->len;
   uint8_t *enc = nullptr;
 
-  if (curEffect && decoded) {                      // bake the active effect into the saved file
+	  if (effects[curEffect].fn && decoded) {          // software effect: bake it in by re-encoding
+			//  if (curEffect && decoded) {                      // bake the active effect into the saved file
     const uint8_t snapQuality = 90;                // 0-100, higher = better
     if (!FRAME_BE) fxByteSwap(frameBuf, IMG_W * IMG_H);   // encoder expects the camera's byte order
     bool ok = fmt2jpg((uint8_t *)frameBuf, IMG_W * IMG_H * 2, IMG_W, IMG_H,
@@ -645,7 +660,8 @@ void loop() {
         fxSel = ((fxSel + steps) % NUM_EFFECTS + NUM_EFFECTS) % NUM_EFFECTS;
         drawEffects();
       }
-      if (ev == 1) { curEffect = fxSel; mode = LIVE; }          // select, return to live view
+			if (ev == 1) { selectEffect(fxSel); mode = LIVE; }        // select, return to live view
+			//      if (ev == 1) { curEffect = fxSel; mode = LIVE; }          // select, return to live view
       break;
     }
   }
