@@ -1,6 +1,9 @@
 #include <Arduino_GFX_Library.h>
 #include <SD_MMC.h>
 #include <esp_camera.h>
+#include <vector>
+#include <algorithm>
+#include "img_converters.h"
 
 // ---- Display pins ----
 #define TFT_SCK 21
@@ -21,9 +24,25 @@
 #define SD_D0  40
 
 bool sdOk = false;
-bool lastSw = HIGH;
+// bool lastSw = HIGH;
 uint32_t msgUntil = 0;
 const char *msg = "";
+
+#define IMG_W 320
+#define IMG_H 240
+#define LONG_MS 700
+#define ENC_COUNTS_PER_STEP 2   // set to 1 if one click skips a row, 4 if it takes several clicks
+
+enum Mode { LIVE, LIST, VIEW };
+Mode mode = LIVE;
+
+std::vector<String> files;
+int sel = 0;
+int encAccum = 0;
+uint16_t *viewBuf = nullptr;
+
+bool swDown = false, longFired = false;
+uint32_t swSince = 0;
 
 // ---- Freenove ESP32-S3 WROOM camera pins ----
 #define PWDN_GPIO_NUM -1
@@ -103,6 +122,89 @@ void saveSnapshot(camera_fb_t *fb) {
   msgUntil = millis() + 1500;
 }
 
+// 0 = nothing, 1 = short press (on release), 2 = long press (fires while held)
+int readButton() {
+  bool down = digitalRead(ENC_SW) == LOW;
+  uint32_t now = millis();
+  int ev = 0;
+  if (down && !swDown) {
+    swDown = true; swSince = now; longFired = false;
+  } else if (down && swDown && !longFired && now - swSince >= LONG_MS) {
+    longFired = true; ev = 2;
+  } else if (!down && swDown) {
+    swDown = false;
+    if (!longFired && now - swSince > 30) ev = 1;
+  }
+  return ev;
+}
+
+void loadList() {
+  files.clear();
+  File root = SD_MMC.open("/");
+  if (root) {
+    File f;
+    while ((f = root.openNextFile())) {
+      String n = f.name();
+      if (!f.isDirectory() && n.startsWith("IMG_") && n.endsWith(".jpg")) files.push_back(n);
+      f.close();
+    }
+    root.close();
+  }
+  std::sort(files.begin(), files.end());
+  if (sel >= (int)files.size()) sel = max(0, (int)files.size() - 1);
+}
+
+void drawList() {
+  const int rowH = 24, rows = 9;
+  gfx->fillScreen(RGB565_BLACK);
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_CYAN, RGB565_BLACK);
+  gfx->setCursor(4, 4);
+  gfx->printf("Images (%d)", (int)files.size());
+  if (files.empty()) {
+    gfx->setTextColor(RGB565_WHITE, RGB565_BLACK);
+    gfx->setCursor(8, 40);
+    gfx->print(sdOk ? "No images yet" : "No SD card");
+    return;
+  }
+  int top = constrain(sel - rows / 2, 0, max(0, (int)files.size() - rows));
+  for (int i = 0; i < rows && top + i < (int)files.size(); i++) {
+    int idx = top + i, y = 24 + i * rowH;
+    uint16_t bg = (idx == sel) ? RGB565_BLUE : RGB565_BLACK;
+    gfx->fillRect(0, y, 320, rowH, bg);
+    gfx->setTextColor(RGB565_WHITE, bg);
+    gfx->setCursor(8, y + 4);
+    gfx->print(files[idx]);
+  }
+}
+
+bool showImage(const String &name) {
+  File f = SD_MMC.open("/" + name, FILE_READ);
+  if (!f) return false;
+  size_t len = f.size();
+  uint8_t *jpg = (uint8_t *)ps_malloc(len);
+  if (!jpg) { f.close(); return false; }
+  f.read(jpg, len);
+  f.close();
+  bool ok = jpg2rgb565(jpg, len, (uint8_t *)viewBuf, JPG_SCALE_NONE);
+  free(jpg);
+  if (ok) {
+		//    gfx->draw16bitBeRGBBitmap(0, 0, viewBuf, IMG_W, IMG_H);
+		gfx->draw16bitRGBBitmap(0, 0, viewBuf, IMG_W, IMG_H);
+    gfx->setTextSize(1);
+    gfx->setTextColor(RGB565_WHITE, RGB565_BLACK);
+    gfx->setCursor(2, 230);
+    gfx->print(name);
+  } else {
+    gfx->fillScreen(RGB565_BLACK);
+    gfx->setTextSize(2);
+    gfx->setTextColor(RGB565_RED, RGB565_BLACK);
+    gfx->setCursor(8, 8);
+    gfx->print("Can't open image");
+  }
+  return ok;
+}
+
 void setup() {
 
 	Serial.begin(115200);
@@ -110,6 +212,8 @@ void setup() {
 	SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
 	sdOk = SD_MMC.begin("/sdcard", true);   // true = 1-bit mode
 	Serial.println(sdOk ? "SD mounted" : "SD mount failed");
+
+	viewBuf = (uint16_t *)ps_malloc(IMG_W * IMG_H * 2);
 	
 	//  pinMode(TFT_BLK, OUTPUT); digitalWrite(TFT_BLK, HIGH);
   pinMode(ENC_A, INPUT_PULLUP); pinMode(ENC_B, INPUT_PULLUP); pinMode(ENC_SW, INPUT_PULLUP);
@@ -129,32 +233,65 @@ void setup() {
 }
 
 void loop() {
-  // Encoder rotation -> camera brightness (-2..2)
-  int d = encDelta; encDelta = 0;
-  if (d) {
-    brightness = constrain(brightness + (d > 0 ? 1 : -1), -2, 2);
-    esp_camera_sensor_get()->set_brightness(esp_camera_sensor_get(), brightness);
-  }
+  int ev = readButton();
 
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return;
+  noInterrupts(); int d = encDelta; encDelta = 0; interrupts();
 
-  // Encoder push -> save snapshot (on press edge only)
-  bool sw = digitalRead(ENC_SW);
-  if (lastSw == HIGH && sw == LOW) {
-    saveSnapshot(fb);
-    delay(50);   // simple debounce
-  }
-  lastSw = sw;
+  switch (mode) {
 
-  gfx->draw16bitBeRGBBitmap(0, 0, (uint16_t *)fb->buf, fb->width, fb->height);
-  esp_camera_fb_return(fb);
+    case LIVE: {
+      if (ev == 2) {
+        loadList(); encAccum = 0; mode = LIST; drawList();
+        break;
+      }
+      if (d) {
+        brightness = constrain(brightness + (d > 0 ? 1 : -1), -2, 2);
+        esp_camera_sensor_get()->set_brightness(esp_camera_sensor_get(), brightness);
+      }
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (!fb) return;
+      if (ev == 1) saveSnapshot(fb);
+      gfx->draw16bitBeRGBBitmap(0, 0, (uint16_t *)fb->buf, fb->width, fb->height);
+      esp_camera_fb_return(fb);
 
-  // On-screen feedback
-  if (millis() < msgUntil) {
-    gfx->setTextSize(2);
-    gfx->setTextColor(RGB565_GREEN, RGB565_BLACK);
-    gfx->setCursor(8, 8);
-    gfx->print(msg);
+      if (millis() < msgUntil) {
+        gfx->setTextSize(2);
+        gfx->setTextColor(RGB565_GREEN, RGB565_BLACK);
+        gfx->setCursor(8, 8);
+        gfx->print(msg);
+      }
+      break;
+    }
+
+    case LIST: {
+      if (ev == 2) { mode = LIVE; break; }
+      int n = files.size();
+      encAccum += d;
+      int steps = encAccum / ENC_COUNTS_PER_STEP;
+      encAccum -= steps * ENC_COUNTS_PER_STEP;
+      if (steps && n) {
+        sel = ((sel + steps) % n + n) % n;
+        drawList();
+      }
+      if (ev == 1 && n) {
+        mode = VIEW; encAccum = 0;
+        showImage(files[sel]);
+      }
+      break;
+    }
+
+    case VIEW: {
+      if (ev == 2) { mode = LIVE; break; }
+      int n = files.size();
+      encAccum += d;
+      int steps = encAccum / ENC_COUNTS_PER_STEP;
+      encAccum -= steps * ENC_COUNTS_PER_STEP;
+      if (steps && n) {
+        sel = ((sel + steps) % n + n) % n;
+        showImage(files[sel]);
+      }
+      if (ev == 1) { mode = LIST; encAccum = 0; drawList(); }
+      break;
+    }
   }
 }
