@@ -1,5 +1,5 @@
 // ESP32-S3 CAM + ST7789 + rotary encoder
-// Live view, snapshots, MJPEG/AVI video recording, gallery with image viewer and video player.
+// Live view, snapshots, MJPEG/AVI video recording, gallery, effects menu.
 //
 // Board: ESP32S3 Dev Module, PSRAM: OPI PSRAM
 // Library: GFX Library for Arduino
@@ -21,12 +21,13 @@
 #define DISPLAY_IPS      false   // inversion flag (the one that fixed the inverted colors)
 #define CAM_VFLIP        1
 #define CAM_HMIRROR      0
+#define FRAME_BE         false    // byte order of decoded frames. If colors look swapped, set false.
 
 // ======================= Encoder / buttons =======================
 #define ENC_A   1
 #define ENC_B   2
 #define ENC_SW  3
-#define REC_BTN 0                // onboard BOOT button. Or wire display K0 to a free pin and change this.
+#define REC_BTN 0                // K0 (and the onboard BOOT button, same pin)
 
 // ======================= SD card (Freenove 1-bit SD_MMC) =======================
 #define SD_CLK 39
@@ -64,8 +65,17 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, G
 Arduino_GFX *gfx = new Arduino_ST7789(bus, TFT_RST, DISPLAY_ROTATION, DISPLAY_IPS, 240, 320);
 
 // ======================= State =======================
-enum Mode { LIVE, LIST, VIEW, PLAYBACK };
+enum Mode { LIVE, LIST, VIEW, PLAYBACK, EFFECTS };
 Mode mode = LIVE;
+
+struct Btn {
+  uint8_t pin;
+  bool down;
+  bool longFired;
+  uint32_t since;
+};
+Btn encBtn = {ENC_SW, false, false, 0};
+Btn kBtn = {REC_BTN, false, false, 0};
 
 int brightness = 0;
 volatile int encDelta = 0;
@@ -81,9 +91,6 @@ uint8_t *jpgBuf = nullptr;      // one JPEG, shared by viewer / player
 
 std::vector<String> files;
 int sel = 0;
-
-bool swDown = false, longFired = false;
-uint32_t swSince = 0;
 
 // recording
 struct IdxEntry { uint32_t off, size; };
@@ -114,8 +121,13 @@ void fatal(const char *m) {
   while (true) delay(1000);
 }
 
-// If colors look swapped for decoded frames, change Be -> plain here (one place for everything).
-inline void blit(uint16_t *buf) { gfx->draw16bitRGBBitmap(0, 0, buf, IMG_W, IMG_H); }
+inline void blit(uint16_t *buf) {
+  if (FRAME_BE) gfx->draw16bitBeRGBBitmap(0, 0, buf, IMG_W, IMG_H);
+  else gfx->draw16bitRGBBitmap(0, 0, buf, IMG_W, IMG_H);
+}
+
+// Pixel value in native byte order (for effects that need to look at the color channels).
+inline uint16_t framePx(uint16_t v) { return FRAME_BE ? __builtin_bswap16(v) : v; }
 
 inline bool decodeToFrame(const uint8_t *jpg, size_t len) {
   return jpg2rgb565(jpg, len, (uint8_t *)frameBuf, JPG_SCALE_NONE);
@@ -124,29 +136,19 @@ inline bool decodeToFrame(const uint8_t *jpg, size_t len) {
 bool isVideo(const String &n) { return n.endsWith(".avi"); }
 
 // 0 = nothing, 1 = short press (on release), 2 = long press (fires while held)
-int readButton() {
-  bool down = digitalRead(ENC_SW) == LOW;
+int readButton(Btn &b) {
+  bool down = digitalRead(b.pin) == LOW;
   uint32_t now = millis();
   int ev = 0;
-  if (down && !swDown) {
-    swDown = true; swSince = now; longFired = false;
-  } else if (down && swDown && !longFired && now - swSince >= LONG_MS) {
-    longFired = true; ev = 2;
-  } else if (!down && swDown) {
-    swDown = false;
-    if (!longFired && now - swSince > 30) ev = 1;
+  if (down && !b.down) {
+    b.down = true; b.since = now; b.longFired = false;
+  } else if (down && b.down && !b.longFired && now - b.since >= LONG_MS) {
+    b.longFired = true; ev = 2;
+  } else if (!down && b.down) {
+    b.down = false;
+    if (!b.longFired && now - b.since > 30) ev = 1;
   }
   return ev;
-}
-
-bool recBtnPressed() {
-  static bool last = HIGH;
-  static uint32_t t = 0;
-  bool v = digitalRead(REC_BTN);
-  bool pressed = (last == HIGH && v == LOW && millis() - t > 200);
-  if (pressed) t = millis();
-  last = v;
-  return pressed;
 }
 
 int encSteps(int d) {
@@ -336,6 +338,62 @@ bool playStep() {
   return true;
 }
 
+// ======================= Effects =======================
+// Effects run on the decoded frame in the live view only. Snapshots and videos are saved
+// unmodified because they come straight from the camera's JPEG.
+// To add an effect: write a function like the two below and add a row to effects[].
+typedef void (*EffectFn)(uint16_t *px, size_t count);
+struct Effect { const char *name; EffectFn fn; };
+
+void fxInvert(uint16_t *px, size_t count) {
+  uint32_t *p = (uint32_t *)px;                // two pixels per 32-bit word
+  for (size_t i = 0; i < count / 2; i++) p[i] = ~p[i];
+}
+
+void fxSwapColors(uint16_t *px, size_t count) {   // red <-> blue
+  for (size_t i = 0; i < count; i++) {
+    uint16_t v = framePx(px[i]);
+    v = ((v & 0x1F) << 11) | (v & 0x07E0) | (v >> 11);
+    px[i] = framePx(v);
+  }
+}
+
+const Effect effects[] = {
+  {"None", nullptr},
+  {"Invert", fxInvert},
+  {"Swap colors", fxSwapColors},
+};
+const int NUM_EFFECTS = sizeof(effects) / sizeof(effects[0]);
+int curEffect = 0;   // active effect
+int fxSel = 0;       // highlighted row in the menu
+
+void applyEffect() {
+  if (effects[curEffect].fn) effects[curEffect].fn(frameBuf, IMG_W * IMG_H);
+}
+
+void drawEffects() {
+  const int rowH = 24, rows = 8;
+  gfx->fillScreen(RGB565_BLACK);
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_CYAN, RGB565_BLACK);
+  gfx->setCursor(4, 4);
+  gfx->print("Effects");
+  int top = constrain(fxSel - rows / 2, 0, max(0, NUM_EFFECTS - rows));
+  for (int i = 0; i < rows && top + i < NUM_EFFECTS; i++) {
+    int idx = top + i, y = 28 + i * rowH;
+    uint16_t bg = (idx == fxSel) ? RGB565_BLUE : RGB565_BLACK;
+    gfx->fillRect(0, y, 320, rowH, bg);
+    gfx->setTextColor(RGB565_WHITE, bg);
+    gfx->setCursor(8, y + 4);
+    gfx->print(effects[idx].name);
+    if (idx == curEffect) {                     // mark the active effect
+      gfx->setTextColor(RGB565_GREEN, bg);
+      gfx->setCursor(290, y + 4);
+      gfx->print("*");
+    }
+  }
+}
+
 // ======================= Gallery =======================
 void loadList() {
   files.clear();
@@ -450,15 +508,27 @@ void drawOverlay() {
     gfx->setCursor(8, 8);
     gfx->print(msg);
   }
+  if (curEffect) {                                 // small label while an effect is active
+    gfx->setTextSize(1);
+    gfx->setTextColor(RGB565_YELLOW, RGB565_BLACK);
+    gfx->setCursor(2, 230);
+    gfx->print(effects[curEffect].name);
+  }
 }
 
-void liveStep(int ev, bool recEv, int d) {
-  if (ev == 2) {                                   // long press -> gallery
+// ev = encoder button event, kev = K0 button event, d = encoder rotation
+void liveStep(int ev, int kev, int d) {
+  if (ev == 2) {                                   // encoder long press -> gallery
     recStop();
     loadList(); encAccum = 0; mode = LIST; drawList();
     return;
   }
-  if (recEv) { if (rec) recStop(); else recStart(); }
+  if (kev == 2) {                                  // K0 long press -> effects menu
+    recStop();
+    fxSel = curEffect; encAccum = 0; mode = EFFECTS; drawEffects();
+    return;
+  }
+  if (kev == 1) { if (rec) recStop(); else recStart(); }   // K0 short press -> record on/off
 
   if (d) {
     brightness = constrain(brightness + (d > 0 ? 1 : -1), -2, 2);
@@ -468,10 +538,13 @@ void liveStep(int ev, bool recEv, int d) {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
   if (rec && !recWrite(fb)) { recStop(); notify("Write failed"); }
-  if (ev == 1) saveSnapshot(fb);                   // short press -> snapshot
+  if (ev == 1) saveSnapshot(fb);                   // encoder short press -> snapshot
   bool ok = decodeToFrame(fb->buf, fb->len);
   esp_camera_fb_return(fb);
-  if (ok) blit(frameBuf);
+  if (ok) {
+    applyEffect();
+    blit(frameBuf);
+  }
   drawOverlay();
 }
 
@@ -503,14 +576,14 @@ void setup() {
 }
 
 void loop() {
-  int ev = readButton();
-  bool recEv = recBtnPressed();
+  int ev = readButton(encBtn);
+  int kev = readButton(kBtn);
   noInterrupts(); int d = encDelta; encDelta = 0; interrupts();
 
   switch (mode) {
 
     case LIVE:
-      liveStep(ev, recEv, d);
+      liveStep(ev, kev, d);
       break;
 
     case LIST: {
@@ -542,5 +615,16 @@ void loop() {
       if (ev == 1) { stopPlay(); mode = LIST; drawList(); break; }
       if (!playStep()) { stopPlay(); mode = LIST; drawList(); }
       break;
+
+    case EFFECTS: {
+      if (ev == 2 || kev == 2) { mode = LIVE; break; }          // cancel, keep current effect
+      int steps = encSteps(d);
+      if (steps) {
+        fxSel = ((fxSel + steps) % NUM_EFFECTS + NUM_EFFECTS) % NUM_EFFECTS;
+        drawEffects();
+      }
+      if (ev == 1) { curEffect = fxSel; mode = LIVE; }          // select, return to live view
+      break;
+    }
   }
 }
