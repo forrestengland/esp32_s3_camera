@@ -1,5 +1,5 @@
 // ESP32-S3 CAM + ST7789 + rotary encoder
-// Live view, snapshots, MJPEG/AVI video recording, gallery, effects + image settings menu.
+// Live view, snapshots, MJPEG/AVI video recording, gallery with image viewer and video player.
 //
 // Board: ESP32S3 Dev Module, PSRAM: OPI PSRAM
 // Library: GFX Library for Arduino
@@ -21,14 +21,12 @@
 #define DISPLAY_IPS      false   // inversion flag (the one that fixed the inverted colors)
 #define CAM_VFLIP        1
 #define CAM_HMIRROR      0
-#define FRAME_BE         false    // byte order of decoded frames. If colors look swapped, set false.
-#define ROTATE_CAMERA_90 0
 
 // ======================= Encoder / buttons =======================
 #define ENC_A   1
 #define ENC_B   2
 #define ENC_SW  3
-#define REC_BTN 0                // K0 (and the onboard BOOT button, same pin)
+#define REC_BTN 0                // onboard BOOT button. Or wire display K0 to a free pin and change this.
 
 // ======================= SD card (Freenove 1-bit SD_MMC) =======================
 #define SD_CLK 39
@@ -66,21 +64,10 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, G
 Arduino_GFX *gfx = new Arduino_ST7789(bus, TFT_RST, DISPLAY_ROTATION, DISPLAY_IPS, 240, 320);
 
 // ======================= State =======================
-enum Mode { LIVE, LIST, VIEW, PLAYBACK, EFFECTS, ADJUST };
+enum Mode { LIVE, LIST, VIEW, PLAYBACK };
 Mode mode = LIVE;
 
-struct Btn {
-  uint8_t pin;
-  bool down;
-  bool longFired;
-  uint32_t since;
-};
-Btn encBtn = {ENC_SW, false, false, 0};
-Btn kBtn = {REC_BTN, false, false, 0};
-
-int brightness = 0;      // sensor image settings, -2..2
-int contrast = 0;
-int saturation = 0;
+int brightness = 0;
 volatile int encDelta = 0;
 int lastA;
 int encAccum = 0;
@@ -90,11 +77,13 @@ char msg[32] = "";
 uint32_t msgUntil = 0;
 
 uint16_t *frameBuf = nullptr;   // one decoded RGB565 frame, shared by live / viewer / player
-uint16_t *rotatedBuf = nullptr;
 uint8_t *jpgBuf = nullptr;      // one JPEG, shared by viewer / player
 
 std::vector<String> files;
 int sel = 0;
+
+bool swDown = false, longFired = false;
+uint32_t swSince = 0;
 
 // recording
 struct IdxEntry { uint32_t off, size; };
@@ -115,7 +104,7 @@ void IRAM_ATTR onEnc() {
 
 void notify(const char *m) { strlcpy(msg, m, sizeof(msg)); msgUntil = millis() + 1500; }
 
-void fatal(const char *m) {
+[[noreturn]] void fatal(const char *m) {
   gfx->fillScreen(RGB565_BLACK);
   gfx->setTextSize(2);
   gfx->setTextColor(RGB565_RED);
@@ -125,55 +114,8 @@ void fatal(const char *m) {
   while (true) delay(1000);
 }
 
-// Rotate clockwise while mapping the result to the
-// existing 320x240 landscape display.
-inline void blit(uint16_t *buf) {
-#if ROTATE_CAMERA_90
-  static uint16_t rotated[IMG_W * IMG_H];
-
-  for (int y = 0; y < IMG_H; y++) {
-    for (int x = 0; x < IMG_W; x++) {
-      // Clockwise rotation, scaled to fit landscape:
-      int srcX = (y * IMG_W) / IMG_H;
-      int srcY = IMG_H - 1 - (x * IMG_H) / IMG_W;
-
-      srcX = constrain(srcX, 0, IMG_W - 1);
-      srcY = constrain(srcY, 0, IMG_H - 1);
-
-      rotated[y * IMG_W + x] =
-          buf[srcY * IMG_W + srcX];
-    }
-  }
-
-  if (FRAME_BE)
-    gfx->draw16bitBeRGBBitmap(0, 0, rotated, IMG_W, IMG_H);
-  else
-    gfx->draw16bitRGBBitmap(0, 0, rotated, IMG_W, IMG_H);
-#else
-  if (FRAME_BE)
-    gfx->draw16bitBeRGBBitmap(0, 0, buf, IMG_W, IMG_H);
-  else
-    gfx->draw16bitRGBBitmap(0, 0, buf, IMG_W, IMG_H);
-#endif
-}
-
-#define ROTATE_CAMERA_90 1  // 1 = rotate clockwise, 0 = disabled
-
-void rotateFrame90(uint16_t *src, uint16_t *dst,
-                   int srcW, int srcH) {
-  for (int y = 0; y < srcH; y++) {
-    for (int x = 0; x < srcW; x++) {
-      // Rotate 90 degrees clockwise
-      int dstX = srcH - 1 - y;
-      int dstY = x;
-
-      dst[dstY * srcH + dstX] = src[y * srcW + x];
-    }
-  }
-}
-
-// Pixel value in native byte order (for effects that need to look at the color channels).
-inline uint16_t framePx(uint16_t v) { return FRAME_BE ? __builtin_bswap16(v) : v; }
+// If colors look swapped for decoded frames, change Be -> plain here (one place for everything).
+inline void blit(uint16_t *buf) { gfx->draw16bitBeRGBBitmap(0, 0, buf, IMG_W, IMG_H); }
 
 inline bool decodeToFrame(const uint8_t *jpg, size_t len) {
   return jpg2rgb565(jpg, len, (uint8_t *)frameBuf, JPG_SCALE_NONE);
@@ -182,19 +124,29 @@ inline bool decodeToFrame(const uint8_t *jpg, size_t len) {
 bool isVideo(const String &n) { return n.endsWith(".avi"); }
 
 // 0 = nothing, 1 = short press (on release), 2 = long press (fires while held)
-int readButton(Btn &b) {
-  bool down = digitalRead(b.pin) == LOW;
+int readButton() {
+  bool down = digitalRead(ENC_SW) == LOW;
   uint32_t now = millis();
   int ev = 0;
-  if (down && !b.down) {
-    b.down = true; b.since = now; b.longFired = false;
-  } else if (down && b.down && !b.longFired && now - b.since >= LONG_MS) {
-    b.longFired = true; ev = 2;
-  } else if (!down && b.down) {
-    b.down = false;
-    if (!b.longFired && now - b.since > 30) ev = 1;
+  if (down && !swDown) {
+    swDown = true; swSince = now; longFired = false;
+  } else if (down && swDown && !longFired && now - swSince >= LONG_MS) {
+    longFired = true; ev = 2;
+  } else if (!down && swDown) {
+    swDown = false;
+    if (!longFired && now - swSince > 30) ev = 1;
   }
   return ev;
+}
+
+bool recBtnPressed() {
+  static bool last = HIGH;
+  static uint32_t t = 0;
+  bool v = digitalRead(REC_BTN);
+  bool pressed = (last == HIGH && v == LOW && millis() - t > 200);
+  if (pressed) t = millis();
+  last = v;
+  return pressed;
 }
 
 int encSteps(int d) {
@@ -223,6 +175,21 @@ bool initCamera() {
   c.fb_location = CAMERA_FB_IN_PSRAM;
   c.grab_mode = CAMERA_GRAB_LATEST;
   return esp_camera_init(&c) == ESP_OK;
+}
+
+// ======================= Snapshot =======================
+void saveSnapshot(camera_fb_t *fb) {
+  if (!sdOk) { notify("No SD card"); return; }
+  char path[24];
+  do {
+    snprintf(path, sizeof(path), "/IMG_%08X.jpg", (unsigned)esp_random());
+  } while (SD_MMC.exists(path));
+
+  File f = SD_MMC.open(path, FILE_WRITE);
+  bool ok = f && f.write(fb->buf, fb->len) == fb->len;
+  if (f) f.close();
+  if (ok) Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)fb->len);
+  notify(ok ? "Saved!" : "Save failed");
 }
 
 // ======================= AVI writing =======================
@@ -369,145 +336,6 @@ bool playStep() {
   return true;
 }
 
-// ======================= Effects =======================
-// Software effects run on the decoded frame (live view; baked into snapshots by re-encoding;
-// not applied to video). Camera effects ("Cam: ...") run inside the sensor, so they are in
-// the live view, snapshots and video alike.
-// To add a software effect: write a function like the ones below and add a row to effects[].
-typedef void (*EffectFn)(uint16_t *px, size_t count);
-struct Effect { const char *name; EffectFn fn; int sensor; };   // sensor: camera effect 0-6
-
-void fxInvert(uint16_t *px, size_t count) {
-  uint32_t *p = (uint32_t *)px;                // two pixels per 32-bit word
-  for (size_t i = 0; i < count / 2; i++) p[i] = ~p[i];
-}
-
-void fxSwapColors(uint16_t *px, size_t count) {   // red <-> blue
-  for (size_t i = 0; i < count; i++) {
-    uint16_t v = framePx(px[i]);
-    v = ((v & 0x1F) << 11) | (v & 0x07E0) | (v >> 11);
-    px[i] = framePx(v);
-  }
-}
-
-void fxByteSwap(uint16_t *px, size_t count) {      // simulates the wrong byte order
-  uint32_t *p = (uint32_t *)px;
-  for (size_t i = 0; i < count / 2; i++) {
-    uint32_t w = p[i];
-    p[i] = ((w & 0x00FF00FF) << 8) | ((w >> 8) & 0x00FF00FF);
-  }
-}
-
-const Effect effects[] = {
-  {"None",             nullptr,       0},
-  {"Invert",           fxInvert,      0},
-  {"Swap colors",      fxSwapColors,  0},
-  {"Byte swap",        fxByteSwap,    0},
-  {"Cam: Negative",    nullptr,       1},
-  {"Cam: Grayscale",   nullptr,       2},
-  {"Cam: Sepia",       nullptr,       6},
-  {"Cam: Red tint",    nullptr,       3},
-  {"Cam: Green tint",  nullptr,       4},
-  {"Cam: Blue tint",   nullptr,       5},
-};
-const int NUM_EFFECTS = sizeof(effects) / sizeof(effects[0]);
-int curEffect = 0;   // active effect
-int fxSel = 0;       // highlighted row in the menu
-
-void selectEffect(int idx) {
-  curEffect = idx;
-  sensor_t *s = esp_camera_sensor_get();
-  s->set_special_effect(s, effects[idx].sensor);   // 0 clears any camera effect
-}
-
-void applyEffect() {
-  if (effects[curEffect].fn) effects[curEffect].fn(frameBuf, IMG_W * IMG_H);
-}
-
-// ---- Adjustable image settings (sensor-side, so they are in snapshots and video too) ----
-// To add one: write a small setter like the three below and add a row to settings[].
-void setBrightnessReg(sensor_t *s, int v) { s->set_brightness(s, v); }
-void setContrastReg(sensor_t *s, int v)   { s->set_contrast(s, v); }
-void setSaturationReg(sensor_t *s, int v) { s->set_saturation(s, v); }
-
-struct Setting { const char *name; int *value; int minV, maxV; void (*set)(sensor_t *, int); };
-const Setting settings[] = {
-  {"Brightness", &brightness, -2, 2, setBrightnessReg},
-  {"Contrast",   &contrast,   -2, 2, setContrastReg},
-  {"Saturation", &saturation, -2, 2, setSaturationReg},
-};
-const int NUM_SETTINGS = sizeof(settings) / sizeof(settings[0]);
-int adjIdx = 0;      // which setting is being adjusted
-
-void applySetting(int i) {
-  settings[i].set(esp_camera_sensor_get(), *settings[i].value);
-}
-
-// Menu rows: all effects first, then the adjustable settings.
-void drawEffects() {
-  const int rowH = 24, rows = 8, total = NUM_EFFECTS + NUM_SETTINGS;
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->setTextSize(2);
-  gfx->setTextColor(RGB565_CYAN, RGB565_BLACK);
-  gfx->setCursor(4, 4);
-  gfx->print("Effects & settings");
-  int top = constrain(fxSel - rows / 2, 0, max(0, total - rows));
-  for (int i = 0; i < rows && top + i < total; i++) {
-    int idx = top + i, y = 28 + i * rowH;
-    uint16_t bg = (idx == fxSel) ? RGB565_BLUE : RGB565_BLACK;
-    gfx->fillRect(0, y, 320, rowH, bg);
-    gfx->setTextColor(RGB565_WHITE, bg);
-    gfx->setCursor(8, y + 4);
-    if (idx < NUM_EFFECTS) {
-      gfx->print(effects[idx].name);
-      if (idx == curEffect) {                   // mark the active effect
-        gfx->setTextColor(RGB565_GREEN, bg);
-        gfx->setCursor(290, y + 4);
-        gfx->print("*");
-      }
-    } else {
-      const Setting &st = settings[idx - NUM_EFFECTS];
-      gfx->print(st.name);
-      gfx->setTextColor(RGB565_YELLOW, bg);
-      gfx->setCursor(262, y + 4);
-      gfx->printf("%+d", *st.value);
-    }
-  }
-}
-
-// ======================= Snapshot =======================
-// Camera effects and plain snapshots save the camera's JPEG as is. A software effect is
-// applied to the decoded frame and re-encoded, so the saved file matches the screen.
-void saveSnapshot(camera_fb_t *fb, bool decoded) {
-  if (!sdOk) { notify("No SD card"); return; }
-
-  const uint8_t *data = fb->buf;
-  size_t len = fb->len;
-  uint8_t *enc = nullptr;
-
-  if (effects[curEffect].fn && decoded) {          // software effect: bake it in
-    const uint8_t snapQuality = 90;                // 0-100, higher = better
-    if (!FRAME_BE) fxByteSwap(frameBuf, IMG_W * IMG_H);   // encoder expects the camera's byte order
-    bool ok = fmt2jpg((uint8_t *)frameBuf, IMG_W * IMG_H * 2, IMG_W, IMG_H,
-                      PIXFORMAT_RGB565, snapQuality, &enc, &len);
-    if (!FRAME_BE) fxByteSwap(frameBuf, IMG_W * IMG_H);   // restore for display
-    if (!ok) { notify("Encode failed"); return; }
-    data = enc;
-  }
-
-  char path[24];
-  do {
-    snprintf(path, sizeof(path), "/IMG_%08X.jpg", (unsigned)esp_random());
-  } while (SD_MMC.exists(path));
-
-  File f = SD_MMC.open(path, FILE_WRITE);
-  bool ok = f && f.write(data, len) == len;
-  if (f) f.close();
-  free(enc);                                       // safe when enc is nullptr
-  if (ok) Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)len);
-  notify(ok ? "Saved!" : "Save failed");
-}
-
 // ======================= Gallery =======================
 void loadList() {
   files.clear();
@@ -622,72 +450,29 @@ void drawOverlay() {
     gfx->setCursor(8, 8);
     gfx->print(msg);
   }
-  if (curEffect) {                                 // small label while an effect is active
-    gfx->setTextSize(1);
-    gfx->setTextColor(RGB565_YELLOW, RGB565_BLACK);
-    gfx->setCursor(2, 230);
-    gfx->print(effects[curEffect].name);
-  }
 }
 
-// ev = encoder button event, kev = K0 button event, d = encoder rotation
-void liveStep(int ev, int kev, int d) {
-  if (ev == 2) {                                   // encoder long press -> gallery
+void liveStep(int ev, bool recEv, int d) {
+  if (ev == 2) {                                   // long press -> gallery
     recStop();
     loadList(); encAccum = 0; mode = LIST; drawList();
     return;
   }
-  if (kev == 2) {                                  // K0 long press -> effects menu
-    recStop();
-    fxSel = curEffect; encAccum = 0; mode = EFFECTS; drawEffects();
-    return;
-  }
-  if (kev == 1) { if (rec) recStop(); else recStart(); }   // K0 short press -> record on/off
+  if (recEv) { if (rec) recStop(); else recStart(); }
 
-  if (d) {                                         // rotation = quick brightness adjust
+  if (d) {
     brightness = constrain(brightness + (d > 0 ? 1 : -1), -2, 2);
-    applySetting(0);
+    esp_camera_sensor_get()->set_brightness(esp_camera_sensor_get(), brightness);
   }
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
   if (rec && !recWrite(fb)) { recStop(); notify("Write failed"); }
+  if (ev == 1) saveSnapshot(fb);                   // short press -> snapshot
   bool ok = decodeToFrame(fb->buf, fb->len);
-  if (ok) applyEffect();
-  if (ev == 1) saveSnapshot(fb, ok);               // encoder short press -> snapshot
   esp_camera_fb_return(fb);
   if (ok) blit(frameBuf);
   drawOverlay();
-}
-
-// Live view with a readout for the setting being adjusted.
-// Rotate = change, K0 short = reset to 0, encoder press / long press / K0 long = done.
-void adjustStep(int ev, int kev, int d) {
-  const Setting &st = settings[adjIdx];
-  if (ev == 1 || ev == 2 || kev == 2) { mode = LIVE; return; }
-  if (kev == 1) { *st.value = 0; applySetting(adjIdx); }
-  int steps = encSteps(d);
-  if (steps) {
-    *st.value = constrain(*st.value + steps, st.minV, st.maxV);
-    applySetting(adjIdx);
-  }
-
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return;
-  bool ok = decodeToFrame(fb->buf, fb->len);
-  esp_camera_fb_return(fb);
-  if (ok) {
-    applyEffect();
-    blit(frameBuf);
-  }
-  gfx->setTextSize(2);
-  gfx->setTextColor(RGB565_YELLOW, RGB565_BLACK);
-  gfx->setCursor(8, 8);
-  gfx->printf("%s %+d ", st.name, *st.value);
-  gfx->setTextSize(1);
-  gfx->setTextColor(RGB565_WHITE, RGB565_BLACK);
-  gfx->setCursor(2, 230);
-  gfx->print("turn: adjust   K0: reset   press: done");
 }
 
 // ======================= Arduino entry points =======================
@@ -708,9 +493,9 @@ void setup() {
   Serial.println(sdOk ? "SD mounted" : "SD mount failed");
 
   frameBuf = (uint16_t *)ps_malloc(IMG_W * IMG_H * 2);
-	rotatedBuf = (uint16_t *)ps_malloc(IMG_W * IMG_H * 2);
   jpgBuf = (uint8_t *)ps_malloc(JPG_BUF_SZ);
-	if (!frameBuf || !rotatedBuf || !jpgBuf) fatal("Out of PSRAM");
+  if (!frameBuf || !jpgBuf) fatal("Out of PSRAM");
+
   if (!initCamera()) fatal("Camera init failed");
   sensor_t *s = esp_camera_sensor_get();
   s->set_vflip(s, CAM_VFLIP);
@@ -718,14 +503,14 @@ void setup() {
 }
 
 void loop() {
-  int ev = readButton(encBtn);
-  int kev = readButton(kBtn);
+  int ev = readButton();
+  bool recEv = recBtnPressed();
   noInterrupts(); int d = encDelta; encDelta = 0; interrupts();
 
   switch (mode) {
 
     case LIVE:
-      liveStep(ev, kev, d);
+      liveStep(ev, recEv, d);
       break;
 
     case LIST: {
@@ -756,31 +541,6 @@ void loop() {
       if (ev == 2) { stopPlay(); mode = LIVE; break; }
       if (ev == 1) { stopPlay(); mode = LIST; drawList(); break; }
       if (!playStep()) { stopPlay(); mode = LIST; drawList(); }
-      break;
-
-    case EFFECTS: {
-      int total = NUM_EFFECTS + NUM_SETTINGS;
-      if (ev == 2 || kev == 2) { mode = LIVE; break; }          // cancel, keep current settings
-      int steps = encSteps(d);
-      if (steps) {
-        fxSel = ((fxSel + steps) % total + total) % total;
-        drawEffects();
-      }
-      if (ev == 1) {
-        if (fxSel < NUM_EFFECTS) {                              // effect: select, back to live
-          selectEffect(fxSel);
-          mode = LIVE;
-        } else {                                                // setting: adjust it on the live view
-          adjIdx = fxSel - NUM_EFFECTS;
-          encAccum = 0;
-          mode = ADJUST;
-        }
-      }
-      break;
-    }
-
-    case ADJUST:
-      adjustStep(ev, kev, d);
       break;
   }
 }
